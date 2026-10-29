@@ -6,7 +6,7 @@
 </head>
 <body>
   <header>
-    <h1>fasttD</h1>
+    <h1><img src="icons/icon-32.png" alt="" width="20" height="20">fasttD</h1>
     <label class="switch" title="Take over browser downloads automatically">
       <input type="checkbox" id="autoCapture">
       <span>Auto-capture</span>
@@ -39,8 +39,10 @@
       <div class="row">
         <span class="name"></span>
         <span class="actions">
-          <button class="save link" hidden>Save</button>
-          <button class="cancel link">Cancel</button>
+          <button class="link" data-action="pause" hidden>Pause</button>
+          <button class="link" data-action="resume" hidden>Resume</button>
+          <button class="link" data-action="save" hidden>Save</button>
+          <button class="link" data-action="cancel" hidden>Cancel</button>
         </span>
       </div>
       <div class="bar"><div class="fill"></div></div>

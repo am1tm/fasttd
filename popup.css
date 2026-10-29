@@ -4,7 +4,7 @@
   --muted: #6e6e73;
   --line: #e5e5ea;
   --track: #ececf0;
-  --accent: #0a66ff;
+  --accent: #f26a0b;
   --ok: #1f9d55;
   --bad: #d93025;
   color-scheme: light dark;
@@ -17,7 +17,7 @@
     --muted: #98989f;
     --line: #38383a;
     --track: #2c2c2e;
-    --accent: #4d8dff;
+    --accent: #ff9330;
     --ok: #34c77b;
     --bad: #ff6b5e;
   }
@@ -41,7 +41,7 @@ header, .row, .list-head, form, .settings {
 }
 
 header { justify-content: space-between; margin-bottom: 12px; }
-h1 { font-size: 16px; margin: 0; }
+h1 { display: flex; align-items: center; gap: 7px; font-size: 16px; margin: 0; }
 
 .switch { display: flex; align-items: center; gap: 6px; color: var(--muted); }
 
@@ -85,6 +85,8 @@ button[type="submit"] {
   font-weight: 600;
 }
 
+input[type="checkbox"] { accent-color: var(--accent); }
+
 button.link {
   background: none;
   border: 0;
@@ -106,6 +108,7 @@ ul { list-style: none; margin: 0; padding: 0; max-height: 360px; overflow-y: aut
 .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 
 .job[data-status="done"] .fill { background: var(--ok); }
+.job[data-status="paused"] .fill { background: var(--muted); }
 .job[data-status="error"] .fill, .job[data-status="canceled"] .fill { background: var(--bad); }
 .job[data-status="error"] .meta { color: var(--bad); }
 

@@ -21,6 +21,9 @@ const toBackground = (type, extra) =>
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const chunkLength = (c) => c.end - c.start + 1;
+const receivedBytes = (job) => job.chunks.reduce((sum, c) => sum + c.received, 0);
+
 // Several chunks per connection so fast connections pick up the slack from
 // slow ones (a work queue instead of IDM's segment splitting).
 function planChunks(size, connections) {
@@ -32,42 +35,90 @@ function planChunks(size, connections) {
   return chunks;
 }
 
-async function fetchChunk(job, chunk) {
+async function fetchChunk(job, chunk, signal) {
+  const handle = await job.dir.getFileHandle(String(chunk.index), { create: true });
   for (let attempt = 1; ; attempt++) {
-    chunk.received = 0;
+    // Whatever reached disk before a pause or a dropped connection is kept,
+    // so only the rest of the chunk is requested.
+    chunk.received = (await handle.getFile()).size;
+    if (chunk.received >= chunkLength(chunk)) return;
     try {
-      const headers = { Range: `bytes=${chunk.start}-${chunk.end}` };
+      const headers = { Range: `bytes=${chunk.start + chunk.received}-${chunk.end}` };
       if (job.validator) headers['If-Range'] = job.validator;
-      const res = await fetch(job.url, { headers, credentials: 'include', signal: job.ctrl.signal });
+      const res = await fetch(job.url, { headers, credentials: 'include', signal });
       if (res.status !== 206) {
         const retryable = res.status === 429 || res.status >= 500;
         // A 200 here means the file changed on the server (If-Range failed)
         // or the server stopped honouring ranges.
         throw new (retryable ? Error : FatalError)(`Server answered ${res.status} to a range request`);
       }
-      const handle = await job.dir.getFileHandle(String(chunk.index), { create: true });
-      const writable = await handle.createWritable();
+      const writable = await handle.createWritable({ keepExistingData: true });
+      await writable.seek(chunk.received);
+      const reader = res.body.getReader();
       job.active++;
       try {
-        await res.body
-          .pipeThrough(new TransformStream({
-            transform(data, ctl) {
-              chunk.received += data.byteLength;
-              ctl.enqueue(data);
-            },
-          }))
-          .pipeTo(writable);
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await writable.write(value);
+          chunk.received += value.byteLength;
+        }
       } finally {
         job.active--;
+        reader.cancel().catch(() => {});
+        // Closing (rather than aborting) commits what was written so far.
+        await writable.close().catch(() => {});
       }
-      if (chunk.received !== chunk.end - chunk.start + 1) throw new Error('Connection closed early');
+      if (chunk.received > chunkLength(chunk)) throw new FatalError('Server sent more data than requested');
+      if (chunk.received < chunkLength(chunk)) throw new Error('Connection closed early');
       return;
     } catch (e) {
-      if (job.ctrl.signal.aborted || e instanceof FatalError || attempt >= MAX_ATTEMPTS) throw e;
+      if (signal.aborted || e instanceof FatalError || attempt >= MAX_ATTEMPTS) throw e;
       job.retries++;
       await sleep(1000 * attempt);
     }
   }
+}
+
+// One download session. Pausing aborts it; resuming starts a new one over
+// whatever chunks are still incomplete.
+async function run(job) {
+  const ctrl = new AbortController();
+  job.ctrl = ctrl;
+  job.status = 'downloading';
+  job.error = null;
+  job.samples = [];
+  const runStartedAt = Date.now();
+  let failure = null;
+
+  const pending = job.chunks.filter((c) => c.received < chunkLength(c));
+  let next = 0;
+  const worker = async () => {
+    while (next < pending.length && !ctrl.signal.aborted) {
+      await fetchChunk(job, pending[next++], ctrl.signal);
+    }
+  };
+  // allSettled so every worker has closed its file before the next session
+  // (or cleanup) touches the same chunks.
+  await Promise.allSettled(
+    Array.from({ length: Math.min(job.connections, pending.length) }, () =>
+      worker().catch((e) => {
+        failure ??= e;
+        ctrl.abort();
+      })),
+  );
+  job.elapsedMs += Date.now() - runStartedAt;
+
+  if (job.status === 'paused') return;
+  if (job.status === 'canceled' || failure) {
+    if (job.status !== 'canceled') {
+      job.status = 'error';
+      job.error = failure.message;
+    }
+    await discard(job);
+    return;
+  }
+  await save(job);
 }
 
 async function startJob(spec) {
@@ -80,31 +131,21 @@ async function startJob(spec) {
     chunks: [],
     samples: [],
     startedAt: Date.now(),
-    endedAt: null,
+    elapsedMs: 0,
     ctrl: new AbortController(),
+    running: Promise.resolve(),
   };
   jobs.set(job.id, job);
   try {
     job.dir = await (await jobsDir).getDirectoryHandle(String(job.id), { create: true });
     job.chunks = planChunks(job.size, job.connections);
-    let next = 0;
-    const worker = async () => {
-      while (next < job.chunks.length && !job.ctrl.signal.aborted) {
-        await fetchChunk(job, job.chunks[next++]);
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(job.connections, job.chunks.length) }, worker));
-    if (job.ctrl.signal.aborted) throw new Error('Canceled');
-    job.endedAt = Date.now();
-    await save(job);
   } catch (e) {
-    job.ctrl.abort();
-    if (job.status !== 'canceled') {
-      job.status = 'error';
-      job.error = e.message;
-    }
+    job.status = 'error';
+    job.error = e.message;
     await discard(job);
+    return;
   }
+  job.running = run(job);
 }
 
 async function save(job) {
@@ -134,21 +175,21 @@ async function discard(job) {
 }
 
 function view(job) {
-  const received = job.chunks.reduce((sum, c) => sum + c.received, 0);
+  const inProgress = job.status === 'downloading' || job.status === 'paused';
   let speed = 0;
   if (job.status === 'downloading' && job.samples.length > 1) {
     const first = job.samples[0];
     const last = job.samples[job.samples.length - 1];
     speed = (last.bytes - first.bytes) / ((last.t - first.t) / 1000);
-  } else if (job.endedAt) {
-    speed = job.size / ((job.endedAt - job.startedAt) / 1000);
+  } else if (!inProgress && job.elapsedMs) {
+    speed = job.size / (job.elapsedMs / 1000);
   }
   return {
     id: job.id,
     filename: job.filename,
     url: job.url,
     size: job.size,
-    received: job.status === 'downloading' ? received : job.size,
+    received: inProgress ? receivedBytes(job) : job.size,
     status: job.status,
     error: job.error,
     active: job.active,
@@ -163,7 +204,7 @@ setInterval(() => {
   const now = Date.now();
   for (const job of jobs.values()) {
     if (job.status !== 'downloading') continue;
-    job.samples.push({ t: now, bytes: job.chunks.reduce((sum, c) => sum + c.received, 0) });
+    job.samples.push({ t: now, bytes: receivedBytes(job) });
     if (job.samples.length > 6) job.samples.shift();
   }
 }, 1000);
@@ -176,14 +217,32 @@ const handlers = {
   list() {
     return [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt).map(view);
   },
+  pause({ jobId }) {
+    const job = jobs.get(jobId);
+    if (job?.status === 'downloading') {
+      job.status = 'paused';
+      job.ctrl.abort();
+    }
+    return {};
+  },
+  async resume({ jobId }) {
+    const job = jobs.get(jobId);
+    if (job?.status !== 'paused') return {};
+    await job.running; // let the paused session finish closing its files
+    if (job.status === 'paused') job.running = run(job);
+    return {};
+  },
   async cancel({ jobId }) {
     const job = jobs.get(jobId);
     if (!job) return {};
     const wasDownloading = job.status === 'downloading';
     job.status = 'canceled';
     job.ctrl.abort();
-    // A running job cleans up after itself in startJob.
-    if (!wasDownloading) await discard(job);
+    // A running session cleans up after itself in run().
+    if (!wasDownloading) {
+      await job.running;
+      await discard(job);
+    }
     return {};
   },
   async save({ jobId }) {

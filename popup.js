@@ -33,6 +33,7 @@ function describe(job) {
       if (job.retries) parts.push(`${job.retries} retries`);
       return parts.join(' · ');
     }
+    case 'paused': return `Paused · ${fmtBytes(job.received)} of ${fmtBytes(job.size)} (${pct}%)`;
     case 'saving': return 'Saving to disk…';
     case 'ready': return job.error ?? 'Ready to save';
     case 'done': return `${fmtBytes(job.size)} · averaged ${fmtBytes(job.speed)}/s`;
@@ -60,8 +61,13 @@ function render(jobs) {
     li.querySelector('.name').title = job.url;
     li.querySelector('.fill').style.width = `${job.size ? (job.received / job.size) * 100 : 0}%`;
     li.querySelector('.meta').textContent = describe(job);
-    li.querySelector('.save').hidden = job.status !== 'ready';
-    li.querySelector('.cancel').hidden = !['downloading', 'ready'].includes(job.status);
+    const visible = {
+      pause: job.status === 'downloading',
+      resume: job.status === 'paused',
+      save: job.status === 'ready',
+      cancel: ['downloading', 'paused', 'ready'].includes(job.status),
+    };
+    for (const button of li.querySelectorAll('[data-action]')) button.hidden = !visible[button.dataset.action];
   }
   for (const [id, li] of rows) {
     if (!seen.has(id)) {
@@ -103,11 +109,10 @@ $('addForm').addEventListener('submit', async (e) => {
 });
 
 $('jobs').addEventListener('click', async (e) => {
-  const button = e.target.closest('button');
+  const button = e.target.closest('[data-action]');
   const li = e.target.closest('.job');
   if (!button || !li) return;
-  const jobId = Number(li.dataset.id);
-  await send('offscreen', button.classList.contains('save') ? 'save' : 'cancel', { jobId });
+  await send('offscreen', button.dataset.action, { jobId: Number(li.dataset.id) });
   refresh();
 });
 
