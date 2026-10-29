@@ -1,13 +1,18 @@
-// Service worker: decides what to accelerate, probes servers, and hands
-// finished files to Chrome's download manager. The actual segmented
-// download runs in the offscreen document (offscreen.js), because only a
-// document can hold blob URLs and keep long transfers alive.
+// Service worker: decides what to accelerate, probes servers, spots media on
+// pages, and hands finished files to Chrome's download manager. The actual
+// segmented download runs in the offscreen document (offscreen.js), because
+// only a document can hold blob URLs and keep long transfers alive.
+
+import { DEFAULTS } from './settings.js';
+import { isHlsMime, isHlsUrl, loadHls } from './hls.js';
 
 const MB = 1024 * 1024;
-const DEFAULTS = { autoCapture: true, connections: 6, minSizeMB: 5 };
 
 // Don't take over a browser download that is already this far along.
 const TAKEOVER_MAX_PROGRESS = 0.5;
+// Media smaller than this is usually an ad, a preview or a tracking pixel.
+const MIN_MEDIA_BYTES = 300 * 1024;
+const MAX_MEDIA_PER_TAB = 30;
 
 const getSettings = () => chrome.storage.sync.get(DEFAULTS);
 
@@ -30,6 +35,19 @@ async function ensureOffscreen() {
     })
     .finally(() => (creatingOffscreen = null));
   await creatingOffscreen;
+}
+
+// Unfinished downloads live in OPFS; the engine picks them up when it loads.
+async function hasSavedJobs() {
+  try {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle('jobs');
+    for await (const _ of dir.keys()) return true;
+  } catch {}
+  return false;
+}
+
+async function resumeSavedJobs() {
+  if (await hasSavedJobs()) await ensureOffscreen();
 }
 
 // fetch() can't set Referer, but some hosts refuse downloads without it.
@@ -57,6 +75,8 @@ async function addRefererRule(id, url, referrer) {
 const removeRule = (id) =>
   chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id] }).catch(() => {});
 
+const sanitize = (name) => name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').replace(/^[.\s]+/, '').trim().slice(0, 180);
+
 export function filenameFrom(contentDisposition, url) {
   let name = '';
   if (contentDisposition) {
@@ -73,8 +93,7 @@ export function filenameFrom(contentDisposition, url) {
       name = decodeURIComponent(new URL(url).pathname.split('/').pop());
     } catch {}
   }
-  name = name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').replace(/^[.\s]+/, '').trim();
-  return name || 'download';
+  return sanitize(name) || 'download';
 }
 
 // Ask for one byte to learn whether the server supports ranges and how big
@@ -105,32 +124,73 @@ async function probe(url) {
   }
 }
 
+async function fetchText(url) {
+  const res = await fetch(url, { credentials: 'include' });
+  if (!res.ok) throw new Error(`Playlist request failed (${res.status})`);
+  return { text: await res.text(), finalUrl: res.url || url };
+}
+
+// Works out how to download a URL: a job spec for the engine, or null when
+// the server can't do parallel downloads.
+async function inspect(url, { allowHls, title }) {
+  if (allowHls && isHlsUrl(url)) return hlsSpec(url, title);
+  const info = await probe(url).catch(() => null);
+  if (allowHls && isHlsMime(info?.mime ?? '')) return hlsSpec(info.finalUrl, title);
+  if (!info?.rangeOk) return null;
+  const { rangeOk, ...spec } = info;
+  return { kind: 'range', ...spec, url: info.finalUrl };
+}
+
+async function hlsSpec(url, title) {
+  const { segments, container, separateAudio } = await loadHls(url, fetchText);
+  const base = sanitize(title || '') || filenameFrom(null, url).replace(/\.m3u8$/i, '');
+  return {
+    kind: 'hls',
+    url,
+    size: 0,
+    segments,
+    filename: `${base}.${container}`,
+    mime: container === 'mp4' ? 'video/mp4' : 'video/mp2t',
+    note: separateAudio ? 'This stream keeps its audio track separate, so the file may be silent.' : null,
+  };
+}
+
 // browserDownloadId is set when we're taking over a download Chrome already
 // started. In that case every failure path leaves Chrome's download alone.
-async function accelerate({ url, referrer, browserDownloadId = null }) {
+async function accelerate({ url, referrer, title, browserDownloadId = null }) {
+  if (!/^https?:/i.test(url)) {
+    return { error: 'This media is streamed in pieces. Open fasttD on the page and pick it under This page.' };
+  }
+  const auto = browserDownloadId != null;
   const settings = await getSettings();
   const id = newJobId();
   await addRefererRule(id, url, referrer).catch(() => {});
 
-  const info = await probe(url).catch(() => null);
-  const auto = browserDownloadId != null;
-  if (!info?.rangeOk || (auto && info.size < settings.minSizeMB * MB)) {
+  let spec;
+  try {
+    // A captured .m3u8 is the playlist file itself, which is what was asked for.
+    spec = await inspect(url, { allowHls: !auto, title });
+  } catch (e) {
     await removeRule(id);
-    if (!auto) await chrome.downloads.download({ url });
-    return;
+    return { error: e.message };
+  }
+  if (!spec || (auto && spec.size < settings.minSizeMB * MB)) {
+    await removeRule(id);
+    if (auto) return {};
+    await chrome.downloads.download({ url });
+    return { fallback: true };
   }
 
-  let filename = info.filename;
   if (auto) {
     const [item] = await chrome.downloads.search({ id: browserDownloadId });
     const progress = item?.totalBytes > 0 ? item.bytesReceived / item.totalBytes : 0;
     if (item?.state !== 'in_progress' || progress > TAKEOVER_MAX_PROGRESS) {
       await removeRule(id);
-      return;
+      return {};
     }
     // Chrome's chosen name already accounts for the original request.
     const chromeName = item.filename.split(/[\\/]/).pop();
-    if (chromeName) filename = chromeName;
+    if (chromeName) spec.filename = chromeName;
     await chrome.downloads.cancel(browserDownloadId);
     await chrome.downloads.erase({ id: browserDownloadId });
   }
@@ -139,16 +199,9 @@ async function accelerate({ url, referrer, browserDownloadId = null }) {
   await chrome.runtime.sendMessage({
     target: 'offscreen',
     type: 'start',
-    job: {
-      id,
-      url: info.finalUrl,
-      size: info.size,
-      filename,
-      mime: info.mime,
-      validator: info.validator,
-      connections: settings.connections,
-    },
+    job: { ...spec, id, referrer, connections: settings.connections },
   });
+  return { started: true };
 }
 
 async function finalizeSave(downloadId, state) {
@@ -158,18 +211,67 @@ async function finalizeSave(downloadId, state) {
   await chrome.storage.session.remove(key);
   if (state === 'complete') await removeRule(jobId);
   await chrome.runtime
-    .sendMessage({ target: 'offscreen', type: 'saved', jobId, ok: state === 'complete' })
+    .sendMessage({ target: 'offscreen', type: 'saved', jobId, downloadId, ok: state === 'complete' })
     .catch(() => {});
 }
 
+// --- Media on pages -------------------------------------------------------
+
+const MEDIA_URL = /\.(mp4|m4v|webm|mkv|mov|avi|flv|mp3|m4a|aac|ogg|oga|opus|flac|wav|m3u8)($|[?#])/i;
+// Individual stream segments: never useful on their own.
+const SEGMENT_URL = /\.(ts|m4s|cmfv|cmfa)($|[?#])/i;
+const SEGMENT_MIME = /^video\/(mp2t|iso\.segment)$/;
+
+const mediaKey = (url) => {
+  const u = new URL(url);
+  return u.origin + u.pathname;
+};
+
+let mediaWrites = Promise.resolve();
+function rememberMedia(tabId, item) {
+  mediaWrites = mediaWrites.then(async () => {
+    const key = `media:${tabId}`;
+    const { [key]: list = [] } = await chrome.storage.session.get(key);
+    const id = mediaKey(item.url);
+    const previous = list.find((m) => mediaKey(m.url) === id);
+    const next = [{ ...item, size: item.size || previous?.size || 0 }, ...list.filter((m) => m !== previous)];
+    await chrome.storage.session.set({ [key]: next.slice(0, MAX_MEDIA_PER_TAB) });
+  }).catch(() => {});
+}
+
+function onMediaResponse(details) {
+  if (details.tabId < 0 || details.statusCode >= 400 || !/^https?:/i.test(details.url)) return;
+  const header = (name) => details.responseHeaders?.find((h) => h.name.toLowerCase() === name)?.value ?? '';
+  const mime = header('content-type').split(';')[0].trim().toLowerCase();
+  const hls = isHlsUrl(details.url) || isHlsMime(mime);
+  const looksLikeMedia = /^(video|audio)\//.test(mime) || (MEDIA_URL.test(details.url) && !mime.startsWith('text/html'));
+  if (!hls && (!looksLikeMedia || SEGMENT_URL.test(details.url) || SEGMENT_MIME.test(mime))) return;
+  // YouTube streams arrive as short-lived pieces that can't be saved on their own.
+  if (new URL(details.url).hostname.endsWith('googlevideo.com')) return;
+  const size = Number(header('content-range').match(/\/(\d+)/)?.[1] ?? header('content-length')) || 0;
+  if (!hls && size && size < MIN_MEDIA_BYTES) return;
+  rememberMedia(details.tabId, { url: details.url, mime, size, hls, at: Date.now() });
+}
+
+chrome.webRequest.onHeadersReceived.addListener(
+  onMediaResponse,
+  { urls: ['<all_urls>'], types: ['media', 'xmlhttprequest', 'other'] },
+  ['responseHeaders'],
+);
+
+const forgetMedia = (tabId) => chrome.storage.session.remove(`media:${tabId}`);
+chrome.tabs.onRemoved.addListener(forgetMedia);
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (change.status === 'loading' && change.url) forgetMedia(tabId);
+});
+
+// --- Messages -------------------------------------------------------------
+
 const handlers = {
   // From the popup.
-  async add({ url }) {
-    await accelerate({ url });
-    return {};
-  },
-  async ensureOffscreen() {
-    await ensureOffscreen();
+  add: ({ url, referrer, title }) => accelerate({ url, referrer, title }),
+  async wake() {
+    await resumeSavedJobs();
     return {};
   },
 
@@ -185,6 +287,10 @@ const handlers = {
     const [item] = await chrome.downloads.search({ id: downloadId });
     if (item && item.state !== 'in_progress') await finalizeSave(downloadId, item.state);
     return { downloadId };
+  },
+  async rule({ jobId, url, referrer }) {
+    await addRefererRule(jobId, url, referrer).catch(() => {});
+    return {};
   },
   async finished({ jobId }) {
     await removeRule(jobId);
@@ -213,15 +319,19 @@ chrome.downloads.onChanged.addListener((delta) => {
   if (state === 'complete' || state === 'interrupted') finalizeSave(delta.id, state);
 });
 
+chrome.runtime.onStartup.addListener(resumeSavedJobs);
+
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
     id: 'fasttd',
     title: 'Download with fasttD',
     contexts: ['link', 'video', 'audio'],
   });
+  // Reloading or updating the extension closes the engine too.
+  resumeSavedJobs();
 });
 
-chrome.contextMenus.onClicked.addListener((info) => {
+chrome.contextMenus.onClicked.addListener((info, tab) => {
   const url = info.linkUrl || info.srcUrl;
-  if (url) accelerate({ url, referrer: info.pageUrl }).catch(console.error);
+  if (url) accelerate({ url, referrer: info.pageUrl, title: tab?.title }).catch(console.error);
 });

@@ -14,9 +14,10 @@
   </header>
 
   <form id="addForm">
-    <input id="url" type="url" placeholder="Paste a download link" required>
+    <input id="url" type="url" placeholder="Paste a download or .m3u8 link" required>
     <button type="submit">Download</button>
   </form>
+  <p id="addStatus" class="status" hidden></p>
 
   <section class="settings">
     <label>Connections
@@ -27,12 +28,24 @@
     </label>
   </section>
 
-  <div class="list-head">
-    <span>Downloads</span>
-    <button id="clear" class="link">Clear finished</button>
-  </div>
-  <ul id="jobs"></ul>
-  <p id="empty" class="empty">Nothing yet. Start a download, paste a link, or right-click a link and pick “Download with fasttD”.</p>
+  <nav class="tabs">
+    <button data-tab="downloads" class="active">Downloads</button>
+    <button data-tab="page">This page <span id="mediaCount" class="count" hidden></span></button>
+  </nav>
+
+  <section id="tab-downloads">
+    <div class="list-head">
+      <span></span>
+      <button id="clear" class="link">Clear finished</button>
+    </div>
+    <ul id="jobs"></ul>
+    <p id="empty" class="empty">Nothing yet. Start a download, paste a link, or right-click a link and pick “Download with fasttD”.</p>
+  </section>
+
+  <section id="tab-page" hidden>
+    <ul id="media"></ul>
+    <p id="mediaEmpty" class="empty">Play a video or song on this page and it will show up here.</p>
+  </section>
 
   <template id="jobTemplate">
     <li class="job">
@@ -42,10 +55,22 @@
           <button class="link" data-action="pause" hidden>Pause</button>
           <button class="link" data-action="resume" hidden>Resume</button>
           <button class="link" data-action="save" hidden>Save</button>
+          <button class="link" data-action="show" hidden>Show</button>
           <button class="link" data-action="cancel" hidden>Cancel</button>
         </span>
       </div>
       <div class="bar"><div class="fill"></div></div>
+      <div class="meta"></div>
+      <div class="note" hidden></div>
+    </li>
+  </template>
+
+  <template id="mediaTemplate">
+    <li class="media">
+      <div class="row">
+        <span class="name"></span>
+        <button class="link" data-action="grab">Download</button>
+      </div>
       <div class="meta"></div>
     </li>
   </template>

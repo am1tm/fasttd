@@ -78,12 +78,7 @@ button[type="submit"] {
 
 .settings label { display: flex; align-items: center; gap: 6px; }
 
-.list-head {
-  justify-content: space-between;
-  border-bottom: 1px solid var(--line);
-  padding-bottom: 6px;
-  font-weight: 600;
-}
+.list-head { justify-content: flex-end; padding: 4px 0; }
 
 input[type="checkbox"] { accent-color: var(--accent); }
 
@@ -113,3 +108,45 @@ ul { list-style: none; margin: 0; padding: 0; max-height: 360px; overflow-y: aut
 .job[data-status="error"] .meta { color: var(--bad); }
 
 .empty { color: var(--muted); text-align: center; padding: 18px 8px; margin: 0; }
+
+.tabs {
+  display: flex;
+  gap: 16px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 4px;
+}
+
+.tabs button {
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 6px 0;
+  margin-bottom: -1px;
+  color: var(--muted);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tabs button.active { color: var(--fg); border-bottom-color: var(--accent); }
+
+.count {
+  display: inline-block;
+  min-width: 16px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+}
+
+.status { margin: 6px 0 0; font-size: 12px; color: var(--muted); }
+.status.error { color: var(--bad); }
+.note { margin-top: 3px; font-size: 12px; color: var(--accent); }
+
+.media { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.media .row { justify-content: space-between; }
+.media .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.media .meta { margin-top: 2px; }
+button.link:disabled { color: var(--muted); cursor: default; }

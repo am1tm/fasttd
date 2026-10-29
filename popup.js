@@ -1,4 +1,4 @@
-const DEFAULTS = { autoCapture: true, connections: 6, minSizeMB: 5 };
+import { DEFAULTS } from './settings.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -19,32 +19,40 @@ function fmtTime(seconds) {
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
+function amount(job) {
+  const pct = Math.floor(job.progress * 100);
+  if (job.kind === 'hls') return `${fmtBytes(job.received)} · segment ${job.segments[0]} of ${job.segments[1]} (${pct}%)`;
+  return `${fmtBytes(job.received)} of ${fmtBytes(job.size)} (${pct}%)`;
+}
+
 function describe(job) {
-  const pct = job.size ? Math.floor((job.received / job.size) * 100) : 0;
   switch (job.status) {
     case 'downloading': {
-      const eta = job.speed ? fmtTime((job.size - job.received) / job.speed) : '';
-      const parts = [
-        `${fmtBytes(job.received)} of ${fmtBytes(job.size)} (${pct}%)`,
-        `${fmtBytes(job.speed)}/s`,
-        `${job.active}/${job.connections} conn`,
-      ];
-      if (eta) parts.push(`${eta} left`);
+      const parts = [amount(job), `${fmtBytes(job.speed)}/s`, `${job.active}/${job.connections} conn`];
+      if (job.eta) parts.push(`${fmtTime(job.eta)} left`);
       if (job.retries) parts.push(`${job.retries} retries`);
       return parts.join(' · ');
     }
-    case 'paused': return `Paused · ${fmtBytes(job.received)} of ${fmtBytes(job.size)} (${pct}%)`;
+    case 'paused': return `Paused · ${amount(job)}`;
     case 'saving': return 'Saving to disk…';
     case 'ready': return job.error ?? 'Ready to save';
-    case 'done': return `${fmtBytes(job.size)} · averaged ${fmtBytes(job.speed)}/s`;
+    case 'done': return `${fmtBytes(job.received)} · averaged ${fmtBytes(job.speed)}/s`;
     case 'canceled': return 'Canceled';
     default: return job.error ?? 'Failed';
   }
 }
 
+const ACTIONS = {
+  pause: ['downloading'],
+  resume: ['paused'],
+  save: ['ready'],
+  show: ['done'],
+  cancel: ['downloading', 'paused', 'ready'],
+};
+
 const rows = new Map();
 
-function render(jobs) {
+function renderJobs(jobs) {
   const list = $('jobs');
   const seen = new Set();
   for (const job of jobs) {
@@ -57,17 +65,17 @@ function render(jobs) {
     }
     list.appendChild(li); // keeps order in sync with the newest-first list
     li.dataset.status = job.status;
+    li.dataset.downloadId = job.downloadId ?? '';
     li.querySelector('.name').textContent = job.filename;
     li.querySelector('.name').title = job.url;
-    li.querySelector('.fill').style.width = `${job.size ? (job.received / job.size) * 100 : 0}%`;
+    li.querySelector('.fill').style.width = `${['done', 'saving', 'ready'].includes(job.status) ? 100 : job.progress * 100}%`;
     li.querySelector('.meta').textContent = describe(job);
-    const visible = {
-      pause: job.status === 'downloading',
-      resume: job.status === 'paused',
-      save: job.status === 'ready',
-      cancel: ['downloading', 'paused', 'ready'].includes(job.status),
-    };
-    for (const button of li.querySelectorAll('[data-action]')) button.hidden = !visible[button.dataset.action];
+    li.querySelector('.note').textContent = job.note ?? '';
+    li.querySelector('.note').hidden = !job.note;
+    for (const button of li.querySelectorAll('[data-action]')) {
+      const action = button.dataset.action;
+      button.hidden = !ACTIONS[action].includes(job.status) || (action === 'show' && !job.downloadId);
+    }
   }
   for (const [id, li] of rows) {
     if (!seen.has(id)) {
@@ -78,10 +86,91 @@ function render(jobs) {
   $('empty').hidden = jobs.length > 0;
 }
 
-async function refresh() {
+async function refreshJobs() {
   const jobs = await send('offscreen', 'list');
-  render(Array.isArray(jobs) ? jobs : []);
+  renderJobs(Array.isArray(jobs) ? jobs : []);
 }
+
+function showStatus(res) {
+  const status = $('addStatus');
+  status.hidden = !res?.error && !res?.fallback;
+  status.classList.toggle('error', Boolean(res?.error));
+  status.textContent = res?.error
+    ?? (res?.fallback ? "This server doesn't allow split downloads, so Chrome is downloading it normally." : '');
+}
+
+// --- This page ------------------------------------------------------------
+
+let currentTab = null;
+
+function mediaName(item) {
+  const path = new URL(item.url).pathname;
+  let name = decodeURIComponent(path.split('/').pop() || path);
+  if (item.hls) name = `${currentTab?.title || 'Stream'} (${name})`;
+  return name;
+}
+
+function mediaMeta(item) {
+  const parts = [item.hls ? 'HLS stream' : item.mime || 'media'];
+  if (item.size) parts.push(fmtBytes(item.size));
+  parts.push(new URL(item.url).hostname);
+  return parts.join(' · ');
+}
+
+async function renderMedia() {
+  if (!currentTab) return;
+  const key = `media:${currentTab.id}`;
+  const { [key]: items = [] } = await chrome.storage.session.get(key);
+  const list = $('media');
+  list.replaceChildren(...items.map((item) => {
+    const li = $('mediaTemplate').content.firstElementChild.cloneNode(true);
+    li.dataset.url = item.url;
+    li.dataset.hls = item.hls ? '1' : '';
+    li.querySelector('.name').textContent = mediaName(item);
+    li.querySelector('.name').title = item.url;
+    li.querySelector('.meta').textContent = mediaMeta(item);
+    return li;
+  }));
+  $('mediaEmpty').hidden = items.length > 0;
+  $('mediaCount').hidden = !items.length;
+  $('mediaCount').textContent = items.length;
+}
+
+$('media').addEventListener('click', async (e) => {
+  const button = e.target.closest('[data-action="grab"]');
+  const li = e.target.closest('.media');
+  if (!button || !li) return;
+  button.disabled = true;
+  button.textContent = 'Starting…';
+  const res = await send('background', 'add', {
+    url: li.dataset.url,
+    referrer: currentTab?.url,
+    title: li.dataset.hls ? currentTab?.title : undefined,
+  });
+  showStatus(res);
+  button.textContent = res?.error ? 'Failed' : 'Added';
+  if (!res?.error) selectTab('downloads');
+  refreshJobs();
+});
+
+chrome.storage.session.onChanged.addListener((changes) => {
+  if (currentTab && changes[`media:${currentTab.id}`]) renderMedia();
+});
+
+// --- Tabs, settings, actions ----------------------------------------------
+
+function selectTab(name) {
+  for (const button of document.querySelectorAll('.tabs button')) {
+    button.classList.toggle('active', button.dataset.tab === name);
+  }
+  $('tab-downloads').hidden = name !== 'downloads';
+  $('tab-page').hidden = name !== 'page';
+}
+
+document.querySelector('.tabs').addEventListener('click', (e) => {
+  const button = e.target.closest('button[data-tab]');
+  if (button) selectTab(button.dataset.tab);
+});
 
 async function initSettings() {
   const select = $('connections');
@@ -104,23 +193,33 @@ $('addForm').addEventListener('submit', async (e) => {
   const url = input.value.trim();
   if (!url) return;
   input.value = '';
-  await send('background', 'add', { url });
-  refresh();
+  showStatus(await send('background', 'add', { url }));
+  refreshJobs();
 });
 
 $('jobs').addEventListener('click', async (e) => {
   const button = e.target.closest('[data-action]');
   const li = e.target.closest('.job');
   if (!button || !li) return;
+  if (button.dataset.action === 'show') {
+    chrome.downloads.show(Number(li.dataset.downloadId));
+    return;
+  }
   await send('offscreen', button.dataset.action, { jobId: Number(li.dataset.id) });
-  refresh();
+  refreshJobs();
 });
 
 $('clear').addEventListener('click', async () => {
   await send('offscreen', 'clear');
-  refresh();
+  refreshJobs();
 });
 
 initSettings();
-refresh();
-setInterval(refresh, 700);
+// Brings back downloads left unfinished by a browser restart, if the engine
+// isn't running yet.
+send('background', 'wake').then(refreshJobs);
+chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+  currentTab = tab ?? null;
+  renderMedia();
+});
+setInterval(refreshJobs, 700);

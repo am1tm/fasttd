@@ -10,7 +10,8 @@
     "contextMenus",
     "storage",
     "unlimitedStorage",
-    "declarativeNetRequestWithHostAccess"
+    "declarativeNetRequestWithHostAccess",
+    "webRequest"
   ],
   "host_permissions": [
     "<all_urls>"
