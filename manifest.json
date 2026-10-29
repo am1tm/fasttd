@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "fasttD",
+  "version": "0.1.0",
+  "description": "Accelerates downloads by fetching files over multiple parallel connections.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "downloads",
+    "offscreen",
+    "contextMenus",
+    "storage",
+    "unlimitedStorage",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "fasttD",
+    "default_popup": "popup.html"
+  }
+}

@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>fasttD</h1>
+    <label class="switch" title="Take over browser downloads automatically">
+      <input type="checkbox" id="autoCapture">
+      <span>Auto-capture</span>
+    </label>
+  </header>
+
+  <form id="addForm">
+    <input id="url" type="url" placeholder="Paste a download link" required>
+    <button type="submit">Download</button>
+  </form>
+
+  <section class="settings">
+    <label>Connections
+      <select id="connections"></select>
+    </label>
+    <label>Capture files over
+      <input id="minSizeMB" type="number" min="0" step="1"> MB
+    </label>
+  </section>
+
+  <div class="list-head">
+    <span>Downloads</span>
+    <button id="clear" class="link">Clear finished</button>
+  </div>
+  <ul id="jobs"></ul>
+  <p id="empty" class="empty">Nothing yet. Start a download, paste a link, or right-click a link and pick “Download with fasttD”.</p>
+
+  <template id="jobTemplate">
+    <li class="job">
+      <div class="row">
+        <span class="name"></span>
+        <span class="actions">
+          <button class="save link" hidden>Save</button>
+          <button class="cancel link">Cancel</button>
+        </span>
+      </div>
+      <div class="bar"><div class="fill"></div></div>
+      <div class="meta"></div>
+    </li>
+  </template>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>
